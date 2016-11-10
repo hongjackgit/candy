@@ -22,11 +22,21 @@ service Notifer {
     // UnSubscribe 用户下线，取消在线推送
     rpc UnSubscribe(UnSubscribeRequest) returns (UnSubscribeResponse);
 
+    // RegionSet 修改当前region的范围
+    rpc RegionSet(RegionSetRequest) returns (RegionSetResponse);
 
     //Push store调用的接口.
     rpc Push(PushRequest) returns (PushResponse);
 }
 
+message RegionSetRequest {
+    int32 Begin = 1;
+    int32 End   = 2;
+}
+
+message RegionSetResponse {
+    ResponseHeader  header = 1;
+}
 
 
 //SubscribeRequest 订阅消息, Device使用的设备，Host从哪台gate上来
@@ -34,20 +44,20 @@ message SubscribeRequest {
     int64   ID      = 1; 
     string  Device  = 2;
     string  Host    = 3;
+    int64   Token   = 4;
 }
 
-//SubscribeResponse 可能返回节点错误或其它错误信息, SID: 订阅流水号，UnSubscribe时要带上这个
+//SubscribeResponse 可能返回节点错误或其它错误信息
 message SubscribeResponse {
     ResponseHeader  header = 1;
-    int64           SID    = 2; 
 }
 
-//UnSubscribeRequest 取消订阅, SID 订阅流水号，防止消息乱序,
+//UnSubscribeRequest 取消订阅
 message UnSubscribeRequest {
     int64   ID      = 1; 
     string  Device  = 2;
     string  Host    = 3;
-    int64   SID     = 4;
+    int64   Token   = 4;
 }
 
 //UnSubscribeResponse 可能返回节点错误或其它错误信息

@@ -1,12 +1,13 @@
 package client
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	"github.com/dearcode/candy/meta"
 	"github.com/dearcode/candy/util"
@@ -41,101 +42,49 @@ type CandyClient struct {
 	gate    meta.GateClient
 	handler MessageHandler
 	stream  meta.Gate_StreamClient
+	id      int64
+	token   int64
 	user    string
 	pass    string
 	device  string
+	closer  chan struct{}
 	sync.RWMutex
 }
 
 // NewCandyClient - create an new CandyClient
 func NewCandyClient(host string, handler MessageHandler) *CandyClient {
-	return &CandyClient{host: host, handler: handler, broken: true}
+	return &CandyClient{host: host, handler: handler, broken: true, closer: make(chan struct{})}
 }
 
 // Start 连接服务端.
 func (c *CandyClient) Start() error {
-	if err := c.connect(); err != nil {
-		return err
-	}
-	go c.healthCheck()
-	go c.loopRecvMessage()
-
-	return nil
-}
-
-//TODO 这里需要重写
-func (c *CandyClient) connect() error {
 	var err error
-	log.Debugf("broken:%v", c.broken)
 
-	if !c.broken {
-		return nil
-	}
-
-	for r := util.NewRetry(util.RetryDurationMax(networkTimeout)); r.Valid(); r.Next() {
-		log.Debugf("retry:%d", r.Attempts())
-		conn, e := grpc.Dial(c.host, grpc.WithInsecure(), grpc.WithTimeout(networkTimeout))
-		if e != nil {
-			log.Errorf("dial:%s error:%s", c.host, e.Error())
-			err = e
-			continue
-		}
-
-		gate := meta.NewGateClient(conn)
-		stream, e := gate.Stream(context.Background(), &meta.Message{})
-		if e != nil {
-			conn.Close()
-			log.Errorf("get stream error:%s", e.Error())
-			err = e
-			continue
-		}
-
-		c.conn = conn
-		c.gate = gate
-		c.stream = stream
-		err = nil
-
-		break
-	}
-	log.Debugf("connect for break")
-
+	c.conn, err = grpc.Dial(c.host, grpc.WithInsecure(), grpc.WithTimeout(networkTimeout), grpc.WithBackoffMaxDelay(networkTimeout))
 	if err != nil {
-		log.Debugf("connect error:%s", err.Error())
+		log.Errorf("dial:%s error:%s", c.host, err.Error())
 		return err
 	}
 
+	c.gate = meta.NewGateClient(c.conn)
 	c.last = time.Now()
-	c.broken = false
 
-	if c.user != "" && c.pass != "" {
-		log.Debugf("will auto login")
-		req := meta.GateUserLoginRequest{User: c.user, Password: c.pass, Device: c.device}
-		ctx, cancel := context.WithTimeout(context.Background(), networkTimeout)
-		c.gate.Login(ctx, &req)
-		cancel()
-	}
-	log.Debugf("connect %s success", c.host)
+	go c.healthCheck()
 
 	return nil
 }
 
-// service 调用服务器接口，如果调用直接返回error要原样返回，如果是response里的error自己就行了，这里主要处理网络问题
+// service 调用服务器接口, 带上token
 func (c *CandyClient) service(call func(context.Context, meta.GateClient) error) {
-	for r := util.NewRetry(util.RetryDurationMax(networkTimeout)); r.Valid(); r.Next() {
-		ctx, cancel := context.WithTimeout(context.Background(), networkTimeout)
-		c.Lock()
-		err := call(ctx, c.gate)
-		cancel()
-		if err == nil {
-			c.last = time.Now()
-			c.Unlock()
-			break
-		}
-		c.connect()
-		c.Unlock()
-
-		log.Debugf("attempt:%d error:%s", r.Attempts(), err.Error())
+	ctx := util.ContextSet(context.Background(), "token", fmt.Sprintf("%d", c.token))
+	ctx = util.ContextSet(ctx, "id", fmt.Sprintf("%d", c.id))
+	if err := call(ctx, c.gate); err != nil {
+		log.Infof("call:%s error:%s", c.host, err.Error())
+		return
 	}
+	c.Lock()
+	c.last = time.Now()
+	c.Unlock()
 }
 
 // Register 用户注册接口
@@ -164,7 +113,7 @@ func (c *CandyClient) Register(user, passwd string) (int64, error) {
 	return resp.ID, resp.Header.JsonError()
 }
 
-// Login 用户登陆
+// Login 用户登陆, 如果发生连接断开，一定要重新登录
 func (c *CandyClient) Login(user, passwd string) (int64, error) {
 	if code, err := CheckUserName(user); err != nil {
 		return -1, NewError(code, err.Error())
@@ -187,17 +136,18 @@ func (c *CandyClient) Login(user, passwd string) (int64, error) {
 		return -1, err
 	}
 
+	c.token = resp.Token
+	c.id = resp.ID
 	c.user = user
 	c.pass = passwd
 
-	return resp.ID, resp.Header.JsonError()
+	c.startReceiver()
+
+	return resp.ID, nil
 }
 
 // Logout 注销登陆
 func (c *CandyClient) Logout() error {
-	c.user = ""
-	c.pass = ""
-
 	req := &meta.GateUserLogoutRequest{}
 	var resp *meta.GateUserLogoutResponse
 	var err error
@@ -211,7 +161,13 @@ func (c *CandyClient) Logout() error {
 		return err
 	}
 
+	c.user = ""
+	c.pass = ""
+	c.token = 0
+	c.id = 0
+
 	return resp.Header.JsonError()
+
 }
 
 // UpdateUserInfo 更新用户信息， 昵称/头像
@@ -534,54 +490,74 @@ func (c *CandyClient) SendMessage(group, to int64, body string) (int64, error) {
 	return resp.ID, resp.Header.Error()
 }
 
-// loopRecvMessage 一直接收服务器返回消息, 直到出错.
-func (c *CandyClient) loopRecvMessage() {
-	for {
-		c.RLock()
-		stream := c.stream
-		c.RUnlock()
-
-		if stream == nil {
-			c.Lock()
-			c.connect()
-			c.Unlock()
-			continue
+func (c *CandyClient) openStream() (resp meta.Gate_StreamClient, err error) {
+	req := &meta.GateStreamRequest{Token: c.token, ID: c.id}
+	c.service(func(ctx context.Context, api meta.GateClient) error {
+		if resp, err = api.Stream(ctx, req); err != nil {
+			return err
 		}
+		return nil
+	})
+	return
+}
 
+// receiver 一直接收服务器返回消息, 直到出错.
+func (c *CandyClient) receiver(stream meta.Gate_StreamClient) {
+	for {
 		pm, err := stream.Recv()
 		if err != nil {
-			log.Errorf("loopRecvMessage error:%s", err)
-			c.Lock()
-			if stream == c.stream {
-				c.onError(err.Error())
-				c.connect()
-			}
-			c.Unlock()
-			continue
+			log.Errorf("recv error:%s", err)
+			c.onError(err.Error())
+			break
 		}
 		c.handler.OnRecv(int32(pm.Event), int32(pm.Operate), pm.Msg.ID, pm.Msg.Group, pm.Msg.From, pm.Msg.To, pm.Msg.Body)
 	}
 }
 
 func (c *CandyClient) onError(msg string) {
-	c.conn.Close()
+	c.Lock()
 	c.last = time.Now().Add(-time.Minute)
 	if c.broken {
+		c.Unlock()
 		return
 	}
-
 	c.broken = true
+	c.Unlock()
+
+	if strings.Contains(msg, "invalid context") && c.user != "" && c.pass != "" {
+		c.Login(c.user, c.pass)
+	}
+
 	c.handler.OnError(msg)
 }
 
+func (c *CandyClient) startReceiver() {
+	if c.token != 0 && c.id != 0 {
+		stream, err := c.openStream()
+		if err != nil {
+			c.onError(err.Error())
+		}
+
+		go c.receiver(stream)
+
+	}
+}
+
+//onHealth 如果网络正常了，要尝试启动Push Stream
 func (c *CandyClient) onHealth() {
+	c.Lock()
 	c.last = time.Now()
 	if !c.broken {
+		c.Unlock()
 		return
 	}
-
 	c.broken = false
+	c.Unlock()
+
 	c.handler.OnHealth()
+
+	c.startReceiver()
+
 }
 
 // OnNetStateChange 移动端如果网络状态发生变化要通知这边
@@ -592,13 +568,22 @@ func (c *CandyClient) OnNetStateChange() {
 	c.Unlock()
 }
 
-// healthCheck 健康检查,一分钟发一次, 目前服务器清理超过2分钟的
+// healthCheck 健康检查,60秒发一次, 目前服务器超过90秒会发探活
 func (c *CandyClient) healthCheck() {
 	t := time.NewTicker(networkTimeout)
 	defer t.Stop()
 
+	req := &meta.HeartbeatRequest{}
+	var resp *meta.HeartbeatResponse
+	var err error
+
 	for {
-		<-t.C
+		select {
+		case <-c.closer:
+			t.Stop()
+			return
+		case <-t.C:
+		}
 		c.RLock()
 		if time.Now().Sub(c.last) < time.Minute {
 			c.RUnlock()
@@ -606,18 +591,27 @@ func (c *CandyClient) healthCheck() {
 		}
 		c.RUnlock()
 
-		c.Lock()
-		_, err := healthpb.NewHealthClient(c.conn).Check(context.Background(), &healthpb.HealthCheckRequest{})
+		c.service(func(ctx context.Context, client meta.GateClient) error {
+			resp, err = client.Heartbeat(ctx, req)
+			return err
+		})
+
 		if err != nil {
-			log.Errorf("healthCheck error:%v", err)
+			log.Errorf("Heartbeat error:%v", err)
 			c.onError(err.Error())
-			c.connect()
-			c.Unlock()
 			continue
 		}
+
+		if resp.Header.Error() != nil {
+			log.Errorf("Heartbeat response error:%v", resp.Header.Error())
+			if c.user != "" && c.pass != "" {
+				c.Login(c.user, c.pass)
+			}
+			continue
+		}
+
 		log.Debugf("onHealth")
 		c.onHealth()
-		c.Unlock()
 	}
 }
 
@@ -700,4 +694,13 @@ func (c *CandyClient) LoadGroupList() (string, error) {
 	}
 
 	return string(data), resp.Header.Error()
+}
+
+//Stop 关连接，退出
+func (c *CandyClient) Stop() {
+	if c.id != 0 && c.token != 0 {
+		c.Logout()
+	}
+	c.conn.Close()
+	close(c.closer)
 }
